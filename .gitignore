@@ -1,0 +1,6 @@
+models/VGGish/hub/checkpoints/*.pth
+models/VGGish/hub/checkpoints/*.pt
+models/VGGish/hub/**/checkpoints/*.pth
+models/VGGish/hub/**/checkpoints/*.pt
+*.pt
+*.pth
