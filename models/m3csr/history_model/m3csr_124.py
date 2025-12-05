@@ -4,16 +4,17 @@ import torch.nn.functional as F
 from torchvision import models
 
 """
-M3-CSR 12月4 模型更新
+M3-CSR 12月4日 更新说明
+
     VideoEncoder
-        - 输出分布校准: 新增 LayerNorm(output_dim). 初始化: 63 行; 前向应用: 90 行.
-        - 单位范数: 新增 F.normalize(feat, dim=-1). 规范化多模态的输出数据, 要求在[0, 1], 以便后续层的有效计算. 输出位置: 91 行.
+        - 输出分布校准: 新增 LayerNorm(output_dim).
+        - 单位范数: 新增 F.normalize(feat, dim=-1). 规范化多模态的输出数据, 要求在[0, 1], 以便后续层的有效计算.
 
     AudioEncoder
-        - 自适应缩放: 仅在量化范围时执行 /255.0 位置: 135–140 行. 
-        - 推理稳定性: 设置 eval() 于 103 行; 特征提取处使用 no_grad 于 128–129 行.
-        - 分布校准: 将样本内 z-score 替换为 LayerNorm(output_dim), 适应物品推荐冷启动以及多模态数据的分布. 初始化: 112 行; 投影后应用: 148 行.
-        - 单位范数: 保留 F.normalize(y, dim=-1). 同上, 规范化多模态输出数据 位置: 150 行.
+        - 自适应缩放: 仅在量化范围时执行 /255.0
+        - 推理稳定性: 设置 eval() ; 特征提取处使用 no_grad 
+        - 分布校准: 将样本内 z-score 替换为 LayerNorm(output_dim), 适应物品推荐冷启动以及多模态数据的分布.
+        - 单位范数: 保留 F.normalize(y, dim=-1). 同上, 规范化多模态输出数据.
 
     TextEncoder
         - 待完善
@@ -70,15 +71,15 @@ class VideoEncoder(nn.Module):
         返回:
             [B, D]
         """
-        B, F, C, H, W = frames.size()
+        B, T, C, H, W = frames.size()
         # 1) 合并时间维度, 逐帧送入骨干网络
-        x = frames.reshape(B * F, C, H, W)
+        x = frames.reshape(B * T, C, H, W)
         # 2) 通道归一化到 ImageNet 统计
         x = (x - self.mean) / self.std
         # 3) 骨干网络编码
         feat = self.model(x)
         # 4) 帧级特征做平均池化, 得到视频级表示
-        feat = feat.reshape(B, F, -1).mean(1)
+        feat = feat.reshape(B, T, -1).mean(1)
         feat = self.norm(feat)
         feat = F.normalize(feat, dim=-1)
         return feat

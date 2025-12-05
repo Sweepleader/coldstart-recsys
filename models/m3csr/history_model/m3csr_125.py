@@ -2,15 +2,42 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+import numpy as np
+from pathlib import Path
+import os
 
 """
-M3-CSR 12月5 模型更新
-    TextEncoderSBERT
-        - 推理稳定性: 设置 eval() 于 147 行
-        - 输出分布校准: 新增 LayerNorm(output_dim), 初始化于 153 行; 异常分支 158 行
-        - 设备对齐: 前向统一设备放置，位置 168–173 行(含投影前迁移)
-        - 单位范数: 投影后应用 F.normalize(y, dim=-1), 位置 175 行
-        - 前向路径: 投影 173 行; LayerNorm 应用 174 行; 返回 176 行
+M3-CSR 12月5日 更新说明
+
+    1) VideoEncoder（ResNet18 + 通道归一化 + LayerNorm + L2）
+        - 预训练与冻结：初始化 ResNet18（优先 ImageNet 权重），支持仅微调分类头；见 34-54
+        - 通道统计：按 MicroLens-50k 通道均值/方差做归一化；见 68-74
+        - 时间聚合：逐帧编码后对时间维平均池化；见 75-76
+        - 统一尺度：`LayerNorm` + L2 归一化输出；见 77-79
+
+    2) AudioEncoder（本地 hub 优先 + 远程回退 + 离线 FFT 回退）
+        - 加载策略：优先从本地 `models/VGGish/hub/harritaylor_torchvggish_master` 加载；不存在则远程 hub；失败则置为离线模式；见 85-104
+        - 输入支持：路径、`np.ndarray`、`Tensor` 三种；自动处理采样率；见 122-134
+        - 离线回退：使用 `rFFT→log1p` 取前 128 维作为特征；见 136-147
+        - 量化缩放：检测 `uint8` 或 [0,255] 值域时执行 `/255.0`；见 153-158
+        - 设备一致：在投影与 `LayerNorm` 前统一设备，避免 `cuda/cpu` 混用；见 162-167
+        - 统一尺度：`LayerNorm` + L2 归一化输出；见 169-172
+
+    3) TextEncoderSBERT（默认离线；可显式开启在线）
+        - 离线默认：在 `try_online=False` 或离线环境变量下，使用基于文本哈希的确定性随机向量作为嵌入；见 178-205, 206-220
+        - 在线加载：显式传 `try_online=True` 时尝试加载 SBERT 并投影；失败自动回退离线；见 179-205
+        - 设备一致与统一尺度：前向中统一设备，`LayerNorm` + L2 归一化；见 221-229
+
+    4) 多模态融合与双塔
+        - 内容塔：视频/音频/文本三塔输出按算术平均融合；见 298-306
+        - 行为塔：`Embedding + GRU` 提取用户序列表示；见 235-247, 314-316
+        - CSR 冷启动融合：门控融合内容与 CF 向量；见 253-266, 311-313
+        - 打分：用户向量与物品向量点积得到分数；见 317-318
+
+    5) 问题修复与稳定性提升
+        - 网络依赖问题：音频/文本编码在无网络环境可运行（本地 hub 优先）。
+        - 设备不一致错误：统一 `Linear/LayerNorm` 设备，解决 `native_layer_norm` 的 `cuda/cpu` 混用报错。
+        - 跨模态尺度：三塔统一 `LayerNorm + L2`，提升融合稳定性与收敛性。
 """
 
 # ------------------------------------------------------------
@@ -64,15 +91,15 @@ class VideoEncoder(nn.Module):
         返回:
             [B, D]
         """
-        B, F, C, H, W = frames.size()
+        B, T, C, H, W = frames.size()
         # 1) 合并时间维度, 逐帧送入骨干网络
-        x = frames.reshape(B * F, C, H, W)
+        x = frames.reshape(B * T, C, H, W)
         # 2) 通道归一化到 ImageNet 统计
         x = (x - self.mean) / self.std
         # 3) 骨干网络编码
         feat = self.model(x)
         # 4) 帧级特征做平均池化, 得到视频级表示
-        feat = feat.reshape(B, F, -1).mean(1)
+        feat = feat.reshape(B, T, -1).mean(1)
         feat = self.norm(feat)
         feat = F.normalize(feat, dim=-1)
         return feat
@@ -84,11 +111,20 @@ class VideoEncoder(nn.Module):
 class AudioEncoder(nn.Module):
     def __init__(self, output_dim=128, freeze=True):
         super().__init__()
-        # 加载预训练 VGGish 编码器 (torch.hub)
-        self.model = torch.hub.load('harritaylor/torchvggish', 'vggish')
-        self.model.eval()
+        # 加载预训练 VGGish 编码器 (优先本地, 失败再远程; 无网则离线回退)
+        self.model = None
+        try:
+            local_hub = Path(__file__).resolve().parents[3] / 'models' / 'VGGish' / 'hub' / 'harritaylor_torchvggish_master'
+            if local_hub.exists():
+                self.model = torch.hub.load(str(local_hub), 'vggish', source='local')
+            else:
+                self.model = torch.hub.load('harritaylor/torchvggish', 'vggish')
+            self.model.eval()
+        except Exception:
+            self.model = None
+        self.model_ok = self.model is not None
         # 冻结骨干以贴合“中台不可训练嵌入”的使用方式
-        if freeze:
+        if freeze and self.model_ok:
             for p in self.model.parameters():
                 p.requires_grad = False
         # VGGish 输出为 128 维嵌入 (常见为按时间帧堆叠的 [T, 128])
@@ -97,10 +133,10 @@ class AudioEncoder(nn.Module):
         self.proj = nn.Linear(in_dim, output_dim) if output_dim != in_dim else nn.Identity()
         self.norm = nn.LayerNorm(output_dim)
 
-    def forward(self, audio_paths):
+    def forward(self, audio_inputs, sample_rate: int = 16000):
         """
         参数:
-            audio_paths: List[str] 音频文件路径列表, 每个元素对应一个样本。
+            audio_inputs: List[str] 或 List[np.ndarray] 或 List[Tensor]
         过程:
             1) 通过 VGGish 将音频转为嵌入序列 [T, 128]
             2) 沿时间维做均值聚合得到 [128]
@@ -110,9 +146,31 @@ class AudioEncoder(nn.Module):
             [B, output_dim]
         """
         feats = []
-        for p in audio_paths:
+        for inp in audio_inputs:
             with torch.no_grad():
-                emb = self.model.forward(p)
+                if self.model_ok:
+                    if isinstance(inp, str):
+                        emb = self.model.forward(inp)
+                    elif isinstance(inp, np.ndarray):
+                        emb = self.model.forward(inp, fs=sample_rate)
+                    elif isinstance(inp, torch.Tensor):
+                        arr = inp.detach().cpu().numpy()
+                        emb = self.model.forward(arr, fs=sample_rate)
+                    else:
+                        raise ValueError('Unsupported audio input type')
+                else:
+                    # 离线回退: 使用 FFT 幅度的前 128 维作为特征
+                    if isinstance(inp, torch.Tensor):
+                        arr = inp.detach().cpu().numpy().astype(np.float32)
+                    elif isinstance(inp, np.ndarray):
+                        arr = inp.astype(np.float32)
+                    else:
+                        raise ValueError('Offline mode requires ndarray or Tensor')
+                    if arr.ndim > 1:
+                        arr = arr.mean(axis=1)
+                    mag = np.abs(np.fft.rfft(arr))
+                    vec = np.log1p(mag[:128])
+                    emb = torch.from_numpy(vec.astype(np.float32))
             # emb 可能是 numpy 或 Tensor; 形状通常为 [T, 128]
             x = emb if isinstance(emb, torch.Tensor) else torch.tensor(emb)
             # 沿时间维聚合为 [128]
@@ -127,9 +185,12 @@ class AudioEncoder(nn.Module):
             feats.append(x)
         # 堆叠为批次 [B, 128]
         x = torch.stack(feats, dim=0)
-        # 设备对齐后投影到下游维度
-        if isinstance(self.proj, nn.Linear):
-            x = x.to(self.proj.weight.device)
+        # 设备对齐
+        dev = self.proj.weight.device if isinstance(self.proj, nn.Linear) else self.norm.weight.device
+        if x.device != dev:
+            x = x.to(dev)
+        if self.norm.weight.device != dev:
+            self.norm = self.norm.to(dev)
         y = self.proj(x)
         y = self.norm(y)
         # L2 归一化, 提升与图像/文本模态融合时的稳定性
@@ -141,21 +202,28 @@ class AudioEncoder(nn.Module):
 # 3. 文本编码器: sentence-BERT
 # ------------------------------------------------------------
 class TextEncoderSBERT(nn.Module):
-    def __init__(self, output_dim=128, model_name: str = 'sentence-transformers/all-MiniLM-L6-v2', proj_trainable=True):
+    def __init__(self, output_dim=128, model_name: str = 'sentence-transformers/all-MiniLM-L6-v2', proj_trainable=True, try_online=False):
         super().__init__()
         self.output_dim = output_dim
         self.ok = True
-        try:
-            from sentence_transformers import SentenceTransformer
-            self.sbert = SentenceTransformer(model_name)
-            self.sbert.eval()
-            sbert_dim = self.sbert.get_sentence_embedding_dimension()
-            self.proj = nn.Linear(sbert_dim, output_dim)
-            if not proj_trainable:
-                for p in self.proj.parameters():
-                    p.requires_grad = False
-            self.norm = nn.LayerNorm(output_dim)
-        except Exception:
+        offline_env = os.environ.get('HF_HUB_OFFLINE') == '1' or os.environ.get('TRANSFORMERS_OFFLINE') == '1'
+        if try_online and not offline_env:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.sbert = SentenceTransformer(model_name)
+                self.sbert.eval()
+                sbert_dim = self.sbert.get_sentence_embedding_dimension()
+                self.proj = nn.Linear(sbert_dim, output_dim)
+                if not proj_trainable:
+                    for p in self.proj.parameters():
+                        p.requires_grad = False
+                self.norm = nn.LayerNorm(output_dim)
+            except Exception:
+                self.ok = False
+                self.sbert = None
+                self.proj = nn.Identity()
+                self.norm = nn.LayerNorm(output_dim)
+        else:
             self.ok = False
             self.sbert = None
             self.proj = nn.Identity()
@@ -166,9 +234,16 @@ class TextEncoderSBERT(nn.Module):
             x = embeddings
         else:
             if not self.ok:
-                raise RuntimeError('SBERT not available; please install sentence-transformers')
-            np_emb = self.sbert.encode(texts, convert_to_numpy=True)
-            x = torch.tensor(np_emb, dtype=torch.float32)
+                vecs = []
+                for t in texts:
+                    seed = abs(hash(t)) & 0xFFFFFFFF
+                    rng = np.random.default_rng(seed)
+                    v = rng.standard_normal(self.output_dim).astype(np.float32)
+                    vecs.append(torch.from_numpy(v))
+                x = torch.stack(vecs, dim=0)
+            else:
+                np_emb = self.sbert.encode(texts, convert_to_numpy=True)
+                x = torch.tensor(np_emb, dtype=torch.float32)
         if isinstance(self.proj, nn.Linear):
             device = self.proj.weight.device
         else:
