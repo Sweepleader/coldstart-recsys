@@ -82,7 +82,30 @@ def main():
     except Exception:
         frames = _make_video_input(batch=1, frames=4, h=224, w=224)
 
-    waves = _make_audio_waveforms(batch=1, seconds=1.0, sr=16000)
+    audio_path = _repo_root() / 'models' / 'mutibehavior' / 'test_file' / 'bus_chatter.wav'
+    audio_inputs = [str(audio_path)]
+    use_array = False
+    audio_arr = None
+    audio_sr = 16000
+    try:
+        from scipy.io import wavfile
+        sr, data = wavfile.read(str(audio_path))
+        if hasattr(data, 'dtype') and data.dtype == np.int16:
+            arr = (data.astype(np.float32)) / 32768.0
+        else:
+            arr = data.astype(np.float32)
+        audio_arr = [arr]
+        audio_sr = int(sr)
+        use_array = True
+    except Exception:
+        try:
+            import soundfile as sf
+            data, sr = sf.read(str(audio_path), dtype='float32')
+            audio_arr = [data.astype(np.float32)]
+            audio_sr = int(sr)
+            use_array = True
+        except Exception:
+            use_array = False
 
     txt_path = _repo_root() / 'models' / 'mutibehavior' / 'test_file' / 'text.txt'
     try:
@@ -99,10 +122,13 @@ def main():
     with torch.no_grad():
         yv = ve(frames)
         try:
-            ya = ae(waves)
+            if use_array and audio_arr is not None:
+                ya = ae(audio_arr, sample_rate=audio_sr)
+            else:
+                ya = ae(audio_inputs)
         except Exception as e:
             print(f"警告: AudioEncoder 前向失败，使用随机特征回退。原因: {e}")
-            ya = torch.randn(len(waves), 128)
+            ya = torch.randn(len(audio_inputs), 128)
 
         if te is not None:
             try:
@@ -128,16 +154,18 @@ if __name__ == "__main__":
 输出结果:
     
 [Video] shape=(1, 128)
-[Video] L2 norms (raw)=[0.9999999403953552]
+[Video] L2 norms (raw)=[1.0]
 [Video] L2 norms (after normalize)=[1.0]
-[Video] sample[0][:5]=[0.006887913215905428, -0.0047335075214505196, 0.06495968997478485, 0.041606537997722626, -0.19391018152236938]
+[Video] sample[0][:5]=[0.13246163725852966, 0.07867936044931412, -0.07994518429040909, 0.1286083459854126, -0.2283448874950409]
 [Audio] shape=(1, 128)
-[Audio] L2 norms (raw)=[1.0]
+[Audio] L2 norms (raw)=[0.9999998807907104]
 [Audio] L2 norms (after normalize)=[1.0]
-[Audio] sample[0][:5]=[0.04082070291042328, -0.12883053719997406, 0.026338281109929085, -0.04503937438130379, 0.0035801895428448915]
+[Audio] sample[0][:5]=[0.044482916593551636, -0.13161899149417877, 0.023601843044161797, -0.07109308242797852, 0.16867418587207794]
 [Text] shape=(1, 128)
-[Text] L2 norms (raw)=[1.0]
+[Text] L2 norms (raw)=[0.9999999403953552]
 [Text] L2 norms (after normalize)=[1.0]
-[Text] sample[0][:5]=[-0.19664227962493896, 0.06248032674193382, -0.03976351395249367, 0.0360005646944046, 0.0472908578813076]
+[Text] sample[0][:5]=[0.035908132791519165, 0.05619512498378754, 0.017329175025224686, 0.021952763199806213, -0.06361228972673416]
 [Check] 维度一致性: [128, 128, 128]（期望全为 128）
+
+由于使用数据为本地固定数据, 所以输出结果不变。可复现。
 """
