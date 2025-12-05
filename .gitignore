@@ -4,3 +4,9 @@ models/VGGish/hub/**/checkpoints/*.pth
 models/VGGish/hub/**/checkpoints/*.pt
 *.pt
 *.pth
+models/VGGish/hub/**
+*.wav
+*.ipynb
+*.zip
+*.rar
+data/**
