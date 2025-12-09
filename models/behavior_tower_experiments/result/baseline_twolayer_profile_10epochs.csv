@@ -1,0 +1,6 @@
+epoch,avg_loss,recall@10,ndcg@10,profile,final_recall@10,final_ndcg@10
+3,0.573901,0.399,0.2033,baseline_last,0.4154,0.2122
+5,0.518141,0.4068,0.2065,baseline_last,0.4154,0.2122
+7,0.48367,0.4056,0.2075,baseline_last,0.4154,0.2122
+10,0.452702,0.4154,0.2122,baseline_last,0.4154,0.2122
+

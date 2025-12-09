@@ -1,0 +1,5 @@
+epoch,avg_loss,recall@10,ndcg@10,profile,final_recall@10,final_ndcg@10
+3,0.652021,0.204,0.0933,improved_mean_decay,0.4011,0.202
+5,0.613559,0.3277,0.1582,improved_mean_decay,0.4011,0.202
+7,0.570421,0.3791,0.1868,improved_mean_decay,0.4011,0.202
+10,0.519058,0.4011,0.202,improved_mean_decay,0.4011,0.202
