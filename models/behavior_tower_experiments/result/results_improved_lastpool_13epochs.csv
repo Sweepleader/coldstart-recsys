@@ -1,2 +1,0 @@
-timestamp,tower,pool,decay,emb_dim,max_len,k,num_neg,recall,ndcg,seed
-2025-12-08T20:59:26,improved,last,,128,50,10,100,0.4173,0.21539623475039152,42
