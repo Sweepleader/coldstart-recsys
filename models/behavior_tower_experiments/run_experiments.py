@@ -7,6 +7,7 @@ import numpy as np
 import os
 from datetime import datetime
 import math
+from torch.nn.utils.rnn import pad_sequence
 
 
 def load_num_items(item_path):
@@ -88,8 +89,8 @@ def evaluate_tower(tower, histories, test_df, num_items, device='cpu', k=10, num
             items.append(nid)
         items_t = torch.tensor(items, dtype=torch.long, device=device)
         ivec = tower.item_vectors(items_t)
-        uvec = F.normalize(uvec, dim=-1)
-        ivec = F.normalize(ivec, dim=-1)
+        # uvec = F.normalize(uvec, dim=-1)
+        # ivec = F.normalize(ivec, dim=-1)
         scores = (uvec.unsqueeze(1) * ivec).sum(-1).squeeze(0).detach().cpu().numpy()
         order = scores.argsort()[::-1]
         pos_idx = np.where(order == 0)[0]
@@ -114,7 +115,7 @@ def parse_args():
     p.add_argument('--max_len', type=int, default=50)
     p.add_argument('--k', type=int, default=10)
     p.add_argument('--num_neg', type=int, default=100)
-    p.add_argument('--tower', type=str, default='baseline', choices=['baseline','twolayer','bidirectional','twotwo','improved','timeaware','timeaware_attention','baseline_timeaware'])
+    p.add_argument('--tower', type=str, default='baseline', choices=['baseline','twolayer','bidirectional','twotwo','improved','timeaware','timeaware_attention','timeaware_attention2','baseline_timeaware'])
     p.add_argument('--pool', type=str, default='last', choices=['last','mean'])
     p.add_argument('--decay', type=float, default=None)
     p.add_argument('--decay_start', type=float, default=None)
@@ -124,7 +125,7 @@ def parse_args():
     p.add_argument('--save_csv', type=str, default=None)
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--batch_size', type=int, default=256)
+    p.add_argument('--batch_size', type=int, default=512)
     p.add_argument('--neg', type=int, default=1)
     p.add_argument('--weight_decay', type=float, default=0.0)
     p.add_argument('--freeze_item_emb', action='store_true')
@@ -151,12 +152,13 @@ def main():
     num_items = int(item_df.iloc[:, 0].max())
     train_df = pd.read_csv(args.train_path, sep='\t', names=['user','item','rating','ts'], engine='python')
     num_users = int(train_df['user'].max())
-    num_users = num_users
     histories_items, histories_ts = build_histories_with_ts(args.train_path, num_users)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
     from baseline_tower import BehaviorTowerBaseline, BehaviorTowerBaselineTwoLayer, BehaviorTowerBaselineBidirectional, BehaviorTowerBaselineTwoLayerBidirectional, BehaviorTowerBaselineTimeAware
     from improved_tower import BehaviorTowerImproved
-    from improved_tower_timeaware import BehaviorTowerTimeAware, TimeAwareAttentionBiGRU
+    from improved_tower_timeaware import BehaviorTowerTimeAware, TimeAwareAttentionBiGRU, TimeAwareAttentionBiGRU_regional
+    
     builders = {
         'baseline': lambda: BehaviorTowerBaseline(num_items, emb_dim=args.emb_dim).to(device),
         'twotwo': lambda: BehaviorTowerBaselineTwoLayerBidirectional(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
@@ -165,6 +167,7 @@ def main():
         'improved': lambda: BehaviorTowerImproved(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
         'timeaware': lambda: BehaviorTowerTimeAware(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
         'timeaware_attention': lambda: TimeAwareAttentionBiGRU(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
+        'timeaware_attention2': lambda: TimeAwareAttentionBiGRU_regional(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
         'baseline_timeaware': lambda: BehaviorTowerBaselineTimeAware(num_items, emb_dim=args.emb_dim, dropout=0.1).to(device),
     }
     tower = builders[args.tower]()
@@ -180,12 +183,14 @@ def main():
     train_df = pd.read_csv(args.train_path, sep='\t', names=['user','item','rating','ts'], engine='python')
     train_df['user'] = train_df['user'].astype(int) - 1
     train_df['item'] = train_df['item'].astype(int) - 1
+    
     # 用户正例集合
     user_pos = {}
     for _, r in train_df.iterrows():
         u = int(r['user']); i = int(r['item'])
         user_pos.setdefault(u, set()).add(i)
 
+    # Revert to triples list generation
     triples = []
     rng = np.random.default_rng(args.seed)
     for _, r in train_df.iterrows():
@@ -197,68 +202,6 @@ def main():
             triples.append((u, pos, neg))
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, tower.parameters()), lr=args.lr, weight_decay=args.weight_decay)
-
-    def to_time_buckets(ts_list, max_len):
-        if ts_list is None or len(ts_list) == 0:
-            return [0]
-        xs = ts_list[-max_len:]
-        buckets = []
-        for t in xs:
-            sec = int(t)
-            dsec = sec % (24 * 3600)
-            hour = dsec // 3600
-            buckets.append(int(hour // 2))
-        return buckets
-
-    def bpr_step(batch, current_decay=None):
-        users, pos_items, neg_items = zip(*batch)
-        # 构造每个用户的最近序列
-        seq_tensors = []
-        for u in users:
-            seq = histories_items.get(u, [])
-            if len(seq) == 0:
-                seq = [0]
-            seq = seq[-args.max_len:]
-            seq_tensors.append(torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0))
-        # 逐个前向，避免 padding 影响
-        uvecs = []
-        tower.train()
-        for idx, st in enumerate(seq_tensors):
-            if args.tower in ['timeaware', 'baseline_timeaware', 'timeaware_attention']:
-                lengths = torch.tensor([st.size(1)], dtype=torch.long, device=device)
-                tb = to_time_buckets(histories_ts.get(users[idx], []), args.max_len)
-                tb_t = torch.tensor(tb, dtype=torch.long, device=device).unsqueeze(0)
-                
-                if args.tower == 'timeaware_attention':
-                    uv = tower(st, time_gaps=tb_t, lengths=lengths)
-                elif args.pool == 'mean':
-                    uv = tower(st, lengths=lengths, time_gaps=tb_t, pool='mean', decay=current_decay)
-                else:
-                    uv = tower(st, lengths=lengths, time_gaps=tb_t, pool='last', decay=current_decay)
-            elif args.tower == 'improved':
-                lengths = torch.tensor([st.size(1)], dtype=torch.long, device=device)
-                if args.pool == 'mean':
-                    uv = tower(st, lengths=lengths, pool='mean', decay=current_decay)
-                else:
-                    uv = tower(st, lengths=lengths, pool='last', decay=current_decay)
-            else:
-                uv = tower(st)
-            uvecs.append(uv)
-        uvec = torch.stack(uvecs, dim=0).squeeze(1)  # [B, D]
-        pos_t = torch.tensor(pos_items, dtype=torch.long, device=device)
-        neg_t = torch.tensor(neg_items, dtype=torch.long, device=device)
-        ivec_pos = tower.item_vectors(pos_t)
-        ivec_neg = tower.item_vectors(neg_t)
-        uvec = F.normalize(uvec, dim=-1)
-        ivec_pos = F.normalize(ivec_pos, dim=-1)
-        ivec_neg = F.normalize(ivec_neg, dim=-1)
-        pos_scores = (uvec * ivec_pos).sum(-1)
-        neg_scores = (uvec * ivec_neg).sum(-1)
-        x = pos_scores - neg_scores
-        loss = -torch.log(torch.sigmoid(x) + 1e-8).mean()
-        return loss
-
-    num_batches = math.ceil(len(triples) / args.batch_size)
 
     def compute_decay(epoch_idx):
         if args.decay_schedule == 'none':
@@ -274,27 +217,103 @@ def main():
             return start + (end - start) * t
         # cosine
         return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * t))
+
     for epoch in range(1, args.epochs + 1):
         current_decay = compute_decay(epoch)
-        total = 0.0
-        for b in range(num_batches):
-            s = b * args.batch_size
-            e = min(len(triples), s + args.batch_size)
-            batch = triples[s:e]
+        total_loss = 0.0
+        tower.train()
+        
+        # Manual batching and shuffling
+        random.shuffle(triples)
+        
+        # Process in batches
+        steps = (len(triples) + args.batch_size - 1) // args.batch_size
+        
+        for step in range(steps):
+            batch = triples[step * args.batch_size : (step + 1) * args.batch_size]
+            u_ids, pos_list, neg_list = zip(*batch)
+            
+            pos = torch.tensor(pos_list, dtype=torch.long).to(device)
+            neg = torch.tensor(neg_list, dtype=torch.long).to(device)
+            
+            # Prepare sequences
+            batch_seqs = []
+            batch_times = []
+            for u in u_ids:
+                seq = histories_items.get(u, [])
+                if len(seq) == 0: seq = [0]
+                seq = seq[-args.max_len:]
+                batch_seqs.append(torch.tensor(seq, dtype=torch.long))
+                
+                if histories_ts is not None:
+                    ts_list = histories_ts.get(u, [])
+                    if not ts_list: ts_list = [0]
+                    ts_list = ts_list[-args.max_len:]
+                    buckets = []
+                    for t in ts_list:
+                        sec = int(t)
+                        dsec = sec % (24 * 3600)
+                        hour = dsec // 3600
+                        buckets.append(int(hour // 2))
+                    batch_times.append(torch.tensor(buckets, dtype=torch.long))
+            
+            # Pad sequences
+            seqs = pad_sequence(batch_seqs, batch_first=True, padding_value=0).to(device)
+            lengths = torch.tensor([len(s) for s in batch_seqs], dtype=torch.long).to(device)
+            
+            times_t = None
+            if len(batch_times) > 0:
+                times_t = pad_sequence(batch_times, batch_first=True, padding_value=0).to(device)
+            
             optimizer.zero_grad()
-            loss = bpr_step(batch, current_decay=current_decay)
+            
+            # Forward
+            if args.tower in ['timeaware', 'baseline_timeaware', 'timeaware_attention', 'timeaware_attention2']:
+                if args.tower == 'timeaware_attention' or args.tower == 'timeaware_attention2':
+                     uvec = tower(seqs, lengths=lengths, time_gaps=times_t)
+                elif args.pool == 'mean':
+                    uvec = tower(seqs, lengths=lengths, time_gaps=times_t, pool='mean', decay=current_decay)
+                else:
+                    uvec = tower(seqs, lengths=lengths, time_gaps=times_t, pool='last', decay=current_decay)
+            elif args.tower == 'improved':
+                if args.pool == 'mean':
+                    uvec = tower(seqs, lengths=lengths, pool='mean', decay=current_decay)
+                else:
+                    uvec = tower(seqs, lengths=lengths, pool='last', decay=current_decay)
+            else:
+                # Baseline
+                uvec = tower(seqs)
+            
+            # Loss
+            if hasattr(tower, 'item_vectors'):
+                ivec_pos = tower.item_vectors(pos)
+                ivec_neg = tower.item_vectors(neg)
+            else:
+                ivec_pos = tower.item_emb(pos)
+                ivec_neg = tower.item_emb(neg)
+            
+            # No normalization
+            pos_scores = (uvec * ivec_pos).sum(-1)
+            neg_scores = (uvec * ivec_neg).sum(-1)
+            x = pos_scores - neg_scores
+            loss = -torch.log(torch.sigmoid(x) + 1e-8).mean()
+            
             loss.backward()
             optimizer.step()
-            total += loss.item() * len(batch)
-        avg = total / len(triples)
+            
+            total_loss += loss.item() * len(batch)
+            
+        avg = total_loss / len(triples)
         print(f"Epoch {epoch}\tAvgLoss={avg:.6f}")
-        # per-epoch evaluation for profiling (matches run_profile parser)
+        
+        # per-epoch evaluation
         test_df = pd.read_csv(args.test_path, sep='\t', names=['user','item','rating','ts'], engine='python')
-        recall, ndcg = evaluate_tower(tower, histories_items, test_df, num_items, device=device, k=args.k, num_neg=args.num_neg, max_len=args.max_len, pool=args.pool, decay=(current_decay if args.tower in ['improved','timeaware','baseline_timeaware'] else None), histories_ts=(histories_ts if args.tower in ['timeaware','baseline_timeaware', 'timeaware_attention'] else None))
+        recall, ndcg = evaluate_tower(tower, histories_items, test_df, num_items, device=device, k=args.k, num_neg=args.num_neg, max_len=args.max_len, pool=args.pool, decay=(current_decay if args.tower in ['improved','timeaware','baseline_timeaware'] else None), histories_ts=(histories_ts if args.tower in ['timeaware','baseline_timeaware', 'timeaware_attention', 'timeaware_attention2'] else None))
         print(f"Eval Recall@{args.k}={recall:.4f} NDCG@{args.k}={ndcg:.4f}")
+
     test_df = pd.read_csv(args.test_path, sep='\t', names=['user','item','rating','ts'], engine='python')
     final_decay = compute_decay(args.epochs)
-    recall, ndcg = evaluate_tower(tower, histories_items, test_df, num_items, device=device, k=args.k, num_neg=args.num_neg, max_len=args.max_len, pool=args.pool, decay=(final_decay if args.tower in ['improved','timeaware','baseline_timeaware'] else None), histories_ts=(histories_ts if args.tower in ['timeaware','baseline_timeaware', 'timeaware_attention'] else None))
+    recall, ndcg = evaluate_tower(tower, histories_items, test_df, num_items, device=device, k=args.k, num_neg=args.num_neg, max_len=args.max_len, pool=args.pool, decay=(final_decay if args.tower in ['improved','timeaware','baseline_timeaware'] else None), histories_ts=(histories_ts if args.tower in ['timeaware','baseline_timeaware', 'timeaware_attention', 'timeaware_attention2'] else None))
     print(f"Recall@{args.k}={recall:.4f} NDCG@{args.k}={ndcg:.4f}")
     if args.save_csv:
         row = [{

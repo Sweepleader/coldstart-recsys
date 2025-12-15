@@ -12,8 +12,10 @@ def plot_comparisons(result_dir):
     # Read each CSV file
     for file in csv_files:
         filename = os.path.basename(file)
-        # Extract model name from filename (remove _50epochs.csv)
-        model_name = filename.replace('_50epochs.csv', '')
+        # Clean up model name for legend
+        model_name = filename.replace('.csv', '')
+        # Optional: still remove _50epochs if present for cleaner names, but don't require it
+        model_name = model_name.replace('_50epochs', '')
         
         try:
             df = pd.read_csv(file)
@@ -37,15 +39,24 @@ def plot_comparisons(result_dir):
         'ndcg@10': 'NDCG@10'
     }
     
+    # Assign distinct colors to each model
+    # Use tab20 colormap which has 20 distinct colors
+    model_names = sorted(list(data.keys()))
+    cmap = plt.get_cmap('tab20')
+    model_colors = {name: cmap(i % 20) for i, name in enumerate(model_names)}
+
     # Generate plots for each metric
     for metric_col, metric_name in metrics.items():
         plt.figure(figsize=(12, 8))
         
-        for model_name, df in data.items():
+        for model_name in model_names:
+            df = data[model_name]
             if metric_col in df.columns:
                 # Sort by epoch just in case
                 df_sorted = df.sort_values('epoch')
-                plt.plot(df_sorted['epoch'], df_sorted[metric_col], marker='o', label=model_name, linewidth=2, markersize=4)
+                plt.plot(df_sorted['epoch'], df_sorted[metric_col], 
+                         marker='o', label=model_name, linewidth=2, markersize=4,
+                         color=model_colors[model_name])
             else:
                 print(f"Warning: {metric_col} not found in {model_name}")
         

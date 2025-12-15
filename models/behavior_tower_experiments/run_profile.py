@@ -16,11 +16,17 @@ PROFILES = {
     'timeaware_attention_bigru': {
         'cmd': [
             'python', 'models/behavior_tower_experiments/run_experiments.py',
-            '--tower', 'timeaware_attention', '--emb_dim', '128', '--epochs', '50', '--lr', '1e-3', '--batch_size', '256', '--seed', '42'
+            '--tower', 'timeaware_attention', '--emb_dim', '128', '--epochs', '50', '--lr', '1e-3', '--batch_size', '512', '--seed', '42'
         ],
         'name': 'timeaware_attention_bigru'
     },
-}
+    'timeaware_attention_bigru_regional': {
+        'cmd': [
+            'python', 'models/behavior_tower_experiments/run_experiments.py',
+            '--tower', 'timeaware_attention2', '--emb_dim', '128', '--epochs', '10', '--lr', '1e-3', '--batch_size', '256', '--seed', '42'
+        ],
+        'name': 'timeaware_attention_bigru_regional'
+    },
     'twolayer': {
         'cmd': [
             'python', 'models/behavior_tower_experiments/run_experiments.py',
@@ -31,7 +37,7 @@ PROFILES = {
     'bidirectional': {
         'cmd': [
             'python', 'models/behavior_tower_experiments/run_experiments.py',
-            '--tower', 'bidirectional', '--emb_dim', '128', '--epochs', '50', '--lr', '1e-3', '--batch_size', '256', '--neg', '1', '--k', '10', '--num_neg', '100', '--seed', '42'
+            '--tower', 'bidirectional', '--emb_dim', '128', '--epochs', '100', '--lr', '1e-3', '--batch_size', '256', '--neg', '1', '--k', '10', '--num_neg', '100', '--seed', '42'
         ],
         'name': 'bidirectional'
     },

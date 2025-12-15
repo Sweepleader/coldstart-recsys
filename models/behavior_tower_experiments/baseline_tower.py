@@ -53,6 +53,38 @@ class BehaviorTowerBaselineBidirectional(nn.Module):
     def item_vectors(self, item_ids):
         return self.item_emb(item_ids)
 
+class BehaviorTowerGRU(nn.Module):
+    def __init__(self, num_items, emb_dim=128, dropout=0.2, padding_idx=0):
+        super().__init__()
+        self.item_emb = nn.Embedding(num_items, emb_dim, padding_idx=padding_idx)
+        self.dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(
+            emb_dim,
+            emb_dim,
+            batch_first=True,
+            bidirectional=False  # ✅ 因果安全
+        )
+        self.proj = nn.Linear(emb_dim, emb_dim)
+
+    def forward(self, seq_items, seq_lens):
+        """
+        seq_items: (B, T)
+        seq_lens:  (B,)
+        """
+        x = self.item_emb(seq_items)
+        x = self.dropout(x)
+
+        x = pack_padded_sequence(
+            x, seq_lens.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        _, h = self.gru(x)      # h: (1, B, D)
+        h = h.squeeze(0)        # (B, D)
+
+        return self.proj(h)
+
+    def item_vectors(self, item_ids):
+        return self.proj(self.item_emb(item_ids))
 
 class BehaviorTowerBaselineTwoLayerBidirectional(nn.Module):
     def __init__(self, num_items, emb_dim=128, dropout=0.2):
