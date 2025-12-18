@@ -85,28 +85,6 @@ def main():
 
     audio_path = _repo_root() / 'test_file' / 'bus_chatter.wav'
     audio_inputs = [str(audio_path)]
-    use_array = False
-    audio_arr = None
-    audio_sr = 16000
-    try:
-        from scipy.io import wavfile
-        sr, data = wavfile.read(str(audio_path))
-        if hasattr(data, 'dtype') and data.dtype == np.int16:
-            arr = (data.astype(np.float32)) / 32768.0
-        else:
-            arr = data.astype(np.float32)
-        audio_arr = [arr]
-        audio_sr = int(sr)
-        use_array = True
-    except Exception:
-        try:
-            import soundfile as sf
-            data, sr = sf.read(str(audio_path), dtype='float32')
-            audio_arr = [data.astype(np.float32)]
-            audio_sr = int(sr)
-            use_array = True
-        except Exception:
-            use_array = False
 
     txt_path = _repo_root() / 'test_file' / 'text.txt'
     try:
@@ -123,10 +101,7 @@ def main():
     with torch.no_grad():
         yv = ve(frames)
         try:
-            if use_array and audio_arr is not None:
-                ya = ae(audio_arr, sample_rate=audio_sr)
-            else:
-                ya = ae(audio_inputs)
+            ya = ae(audio_inputs)
         except Exception as e:
             print(f"警告: AudioEncoder 前向失败，使用随机特征回退。原因: {e}")
             ya = torch.randn(len(audio_inputs), 128)
